@@ -86,8 +86,8 @@ void I2C_INST_IRQHandler(void)
             }
             break;
         case DL_I2C_IIDX_TARGET_STOP:
-            /* We intentionally DO NOT copy received data into gTxPacket.
-               Just clear the flag and toggle LED to indicate a completed transaction. */
+            /* Do not overwrite gTxPacket — keep "Hello123" intact.
+               Clear dataRx flag so next transfer starts clean. */
             if (dataRx == true) {
                 dataRx = false;
             }

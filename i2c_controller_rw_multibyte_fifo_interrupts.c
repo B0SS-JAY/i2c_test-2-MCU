@@ -1,38 +1,29 @@
-/* Master: continuously send "Hi" then read 8 bytes (expect "Hello123") and print.
+
+/* Master: automatically recover when I2C wires are removed/reinserted.
+   Continuously send "Hi" then read 8 bytes (expect "Hello123") and print.
    Assumes stdio is routed (semihosting or UART). Keep SDA↔SDA, SCL↔SCL, GND↔GND.
 */
 #include "ti_msp_dl_config.h"
 #include <stdio.h>
 
-/* Maximum size of TX packet */
+/* Settings */
 #define I2C_TX_MAX_PACKET_SIZE (16)
-
-/* Number of bytes to send to target device */
-#define I2C_TX_PACKET_SIZE (2)    /* send "Hi" */
-
-/* Maximum size of RX packet */
+#define I2C_TX_PACKET_SIZE     (2)   /* "Hi" */
 #define I2C_RX_MAX_PACKET_SIZE (16)
+#define I2C_RX_PACKET_SIZE     (8)   /* "Hello123" */
+#define I2C_TARGET_ADDRESS     (0x48)
 
-/* Number of bytes to received from target */
-#define I2C_RX_PACKET_SIZE (8)    /* expect "Hello123" */
-
-/* I2C Target address */
-#define I2C_TARGET_ADDRESS (0x48)
-
-/* Data sent to the Target ("Hi") */
+/* Buffers */
 uint8_t gTxPacket[I2C_TX_MAX_PACKET_SIZE] = {
     'H','i', 0x00,0x00,0x00,0x00,0x00,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
 };
-/* Counters for TX length and bytes sent */
-uint32_t gTxLen, gTxCount;
-
-/* Data received from Target */
 uint8_t gRxPacket[I2C_RX_MAX_PACKET_SIZE];
-/* Counters for RX length and bytes received */
+
+/* Counters & state */
+uint32_t gTxLen, gTxCount;
 uint32_t gRxLen, gRxCount;
 
-/* Indicates status of I2C */
 enum I2cControllerStatus {
     I2C_STATUS_IDLE = 0,
     I2C_STATUS_TX_STARTED,
@@ -44,23 +35,48 @@ enum I2cControllerStatus {
     I2C_STATUS_ERROR,
 } gI2cControllerStatus;
 
-int main(void)
+/* Helpers */
+static void short_delay(void)
 {
+    for (volatile int i = 0; i < 200000; i++);
+}
+
+/* Recovery: reinitialize system (clears I2C hardware state) */
+static void recover_i2c(void)
+{
+    /* Disable I2C IRQs to avoid races while reinit */
+    DL_I2C_disableInterrupt(I2C_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
+    DL_I2C_disableInterrupt(I2C_INST, DL_I2C_INTERRUPT_CONTROLLER_RXFIFO_TRIGGER);
+    NVIC_DisableIRQ(I2C_INST_INT_IRQN);
+
+    short_delay();
+
+    /* Re-run board/system init to reset peripheral state */
     SYSCFG_DL_init();
 
-    printf("Master: starting continuous Hi->Hello123 loop\n");
-
-    /* Set LED to indicate start */
-    DL_GPIO_setPins(GPIO_LEDS_PORT, GPIO_LEDS_USER_LED_1_PIN);
-
+    /* Re-enable IRQ & required interrupts (RX trigger always useful) */
     NVIC_EnableIRQ(I2C_INST_INT_IRQN);
-    DL_SYSCTL_disableSleepOnExit();
+    DL_I2C_enableInterrupt(I2C_INST, DL_I2C_INTERRUPT_CONTROLLER_RXFIFO_TRIGGER);
+    /* TXFIFO trigger will be enabled conditionally when needed by code */
 
+    /* Reset local counters/status */
+    gTxCount = 0;
+    gRxCount = 0;
     gI2cControllerStatus = I2C_STATUS_IDLE;
 
-    /* main loop: send "Hi", then read "Hello123", print, repeat */
+    short_delay();
+}
+
+/* Attempt TX with retries and heavier recovery on persistent failures */
+static int attempt_tx_transfer_with_recovery(void)
+{
+    const int MAX_IMMEDIATE_RETRIES = 3;
+    const int MAX_RECOVERY_ATTEMPTS = 5;
+    int immediate_retry = 0;
+    int recovery_attempts = 0;
+
     while (1) {
-        /* --- PREPARE & SEND "Hi" --- */
+        /* Prepare FIFO */
         gTxLen = I2C_TX_PACKET_SIZE;
         gTxCount = DL_I2C_fillControllerTXFIFO(I2C_INST, &gTxPacket[0], gTxLen);
 
@@ -70,68 +86,147 @@ int main(void)
             DL_I2C_disableInterrupt(I2C_INST, DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
         }
 
+        /* Start TX */
         gI2cControllerStatus = I2C_STATUS_TX_STARTED;
-
         while (!(DL_I2C_getControllerStatus(I2C_INST) & DL_I2C_CONTROLLER_STATUS_IDLE))
             ;
-        DL_I2C_startControllerTransfer(I2C_INST, I2C_TARGET_ADDRESS, DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen);
+        DL_I2C_startControllerTransfer(I2C_INST, I2C_TARGET_ADDRESS,
+                                       DL_I2C_CONTROLLER_DIRECTION_TX, gTxLen);
 
-        /* Wait until TX finishes or error */
+        /* Wait until TX completes or error */
         while ((gI2cControllerStatus != I2C_STATUS_TX_COMPLETE) &&
                (gI2cControllerStatus != I2C_STATUS_ERROR)) {
             __WFE();
         }
 
-        if (gI2cControllerStatus == I2C_STATUS_ERROR) {
-            printf("Master: TX error\n");
-            /* small retry delay */
-            for (volatile int i = 0; i < 200000; i++);
+        if (gI2cControllerStatus == I2C_STATUS_TX_COMPLETE) {
+            return 0; /* success */
+        }
+
+        /* Error path */
+        immediate_retry++;
+        printf("Master: TX error (immediate try %d)\n", immediate_retry);
+
+        /* Quick immediate retries */
+        if (immediate_retry < MAX_IMMEDIATE_RETRIES) {
+            gTxCount = 0;
+            gRxCount = 0;
+            gI2cControllerStatus = I2C_STATUS_IDLE;
+            short_delay();
             continue;
         }
 
-        /* Ensure bus idle */
-        while (DL_I2C_getControllerStatus(I2C_INST) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS)
-            ;
+        /* Heavy recovery attempts */
+        if (recovery_attempts < MAX_RECOVERY_ATTEMPTS) {
+            recovery_attempts++;
+            printf("Master: performing I2C reinit recovery attempt %d\n", recovery_attempts);
+            recover_i2c();
+            immediate_retry = 0;
+            continue;
+        }
 
-        /* small gap between write and read */
-        delay_cycles(1000);
+        /* If still failing, wait longer and try again */
+        printf("Master: persistent TX failure — waiting before next attempts\n");
+        for (volatile int i = 0; i < 1000000; i++);
+        /* loop and try again */
+    }
+}
 
-        /* --- REQUEST & RECEIVE (exact 8 bytes for "Hello123") --- */
-        gRxLen = I2C_RX_PACKET_SIZE;   // 8
-        gRxCount = 0;                  // reset counter BEFORE starting RX
+/* Attempt RX with retries and heavier recovery on persistent failures */
+static int attempt_rx_transfer_with_recovery(void)
+{
+    const int MAX_IMMEDIATE_RETRIES = 3;
+    const int MAX_RECOVERY_ATTEMPTS = 5;
+    int immediate_retry = 0;
+    int recovery_attempts = 0;
+
+    while (1) {
+        gRxLen = I2C_RX_PACKET_SIZE;
+        gRxCount = 0;
         gI2cControllerStatus = I2C_STATUS_RX_STARTED;
 
-        DL_I2C_startControllerTransfer(I2C_INST, I2C_TARGET_ADDRESS, DL_I2C_CONTROLLER_DIRECTION_RX, gRxLen);
+        DL_I2C_startControllerTransfer(I2C_INST, I2C_TARGET_ADDRESS,
+                                       DL_I2C_CONTROLLER_DIRECTION_RX, gRxLen);
 
-        /* Wait for RX complete or error */
         while ((gI2cControllerStatus != I2C_STATUS_RX_COMPLETE) &&
                (gI2cControllerStatus != I2C_STATUS_ERROR)) {
             __WFE();
         }
 
-        if (gI2cControllerStatus == I2C_STATUS_ERROR) {
-            printf("Master: RX error\n");
-            for (volatile int i = 0; i < 200000; i++);
+        if (gI2cControllerStatus == I2C_STATUS_RX_COMPLETE) {
+            return 0; /* success */
+        }
+
+        /* Error path */
+        immediate_retry++;
+        printf("Master: RX error (immediate try %d)\n", immediate_retry);
+
+        if (immediate_retry < MAX_IMMEDIATE_RETRIES) {
+            gTxCount = 0;
+            gRxCount = 0;
+            gI2cControllerStatus = I2C_STATUS_IDLE;
+            short_delay();
             continue;
         }
 
-        /* Make sure bus is idle before using data */
-        while (DL_I2C_getControllerStatus(I2C_INST) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS)
-            ;
+        if (recovery_attempts < MAX_RECOVERY_ATTEMPTS) {
+            recovery_attempts++;
+            printf("Master: performing I2C reinit recovery attempt %d\n", recovery_attempts);
+            recover_i2c();
+            immediate_retry = 0;
+            continue;
+        }
 
-        /* Null-terminate exactly at 8 bytes and print */
-        gRxPacket[8] = '\0';
+        printf("Master: persistent RX failure — waiting before next attempts\n");
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+}
+
+int main(void)
+{
+    SYSCFG_DL_init();
+    printf("Master: auto-recover Hi->Hello123 loop starting\n");
+
+    /* Visual LED indicator */
+    DL_GPIO_setPins(GPIO_LEDS_PORT, GPIO_LEDS_USER_LED_1_PIN);
+
+    NVIC_EnableIRQ(I2C_INST_INT_IRQN);
+    DL_SYSCTL_disableSleepOnExit();
+
+    gI2cControllerStatus = I2C_STATUS_IDLE;
+
+    while (1) {
+        /* Attempt TX (internal retries + recovery) */
+        if (attempt_tx_transfer_with_recovery() != 0) {
+            /* unreachable in this structure but keep loop robust */
+            continue;
+        }
+
+        /* Small pause between write and read */
+        delay_cycles(1000);
+
+        /* Attempt RX (internal retries + recovery) */
+        if (attempt_rx_transfer_with_recovery() != 0) {
+            continue;
+        }
+
+        /* Print result safely (null terminate at expected length) */
+        if (I2C_RX_PACKET_SIZE < I2C_RX_MAX_PACKET_SIZE) {
+            gRxPacket[I2C_RX_PACKET_SIZE] = '\0';
+        } else {
+            gRxPacket[I2C_RX_MAX_PACKET_SIZE - 1] = '\0';
+        }
         printf("Master received (%u bytes): %s\n", (unsigned)gRxCount, (char*)gRxPacket);
 
-        /* visual heartbeat */
+        /* Heartbeat */
         DL_GPIO_togglePins(GPIO_LEDS_PORT, GPIO_LEDS_USER_LED_1_PIN | GPIO_LEDS_USER_TEST_PIN);
 
-        /* Pause so output is human-readable (adjust as needed) */
+        /* Delay so console readable */
         for (volatile int i = 0; i < 500000; i++);
     }
 }
 
-/* IRQ handler (keeps your original behavior — updates gRxCount/gTxCount and statuses) */
+/* I2C IRQ handler (keeps original behavior: update counts/status and read/write FIFOs) */
 void I2C_INST_IRQHandler(void)
 {
     switch (DL_I2C_getPendingInterrupt(I2C_INST)) {
@@ -163,7 +258,9 @@ void I2C_INST_IRQHandler(void)
             if ((gI2cControllerStatus == I2C_STATUS_RX_STARTED) || (gI2cControllerStatus == I2C_STATUS_TX_STARTED)) {
                 gI2cControllerStatus = I2C_STATUS_ERROR;
             }
+            break;
         default:
             break;
     }
 }
+
