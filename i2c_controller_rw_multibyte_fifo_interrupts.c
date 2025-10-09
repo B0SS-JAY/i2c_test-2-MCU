@@ -1,22 +1,22 @@
-
 /* Master: automatically recover when I2C wires are removed/reinserted.
-   Continuously send "Hi" then read 8 bytes (expect "Hello123") and print.
+   Writes 1 request byte then reads 2 bytes (cell1 millivolts) and prints.
    Assumes stdio is routed (semihosting or UART). Keep SDA↔SDA, SCL↔SCL, GND↔GND.
 */
 #include "ti_msp_dl_config.h"
 #include <stdio.h>
+#include <stdint.h>
 
 /* Settings */
 #define I2C_TX_MAX_PACKET_SIZE (16)
-#define I2C_TX_PACKET_SIZE     (2)   /* "Hi" */
+#define I2C_TX_PACKET_SIZE     (1)   /* request byte */
 #define I2C_RX_MAX_PACKET_SIZE (16)
-#define I2C_RX_PACKET_SIZE     (8)   /* "Hello123" */
-#define I2C_TARGET_ADDRESS     (0x48)
+#define I2C_RX_PACKET_SIZE     (4)   /* 2 bytes = uint16 mV */
+#define I2C_TARGET_ADDRESS     (0x48) /* change if your slave uses a different 7-bit address */
 
 /* Buffers */
 uint8_t gTxPacket[I2C_TX_MAX_PACKET_SIZE] = {
-    'H','i', 0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+    0x01, /* request byte */
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
 uint8_t gRxPacket[I2C_RX_MAX_PACKET_SIZE];
 
@@ -76,7 +76,7 @@ static int attempt_tx_transfer_with_recovery(void)
     int recovery_attempts = 0;
 
     while (1) {
-        /* Prepare FIFO */
+        /* Prepare FIFO: only 1 byte (request) */
         gTxLen = I2C_TX_PACKET_SIZE;
         gTxCount = DL_I2C_fillControllerTXFIFO(I2C_INST, &gTxPacket[0], gTxLen);
 
@@ -185,7 +185,7 @@ static int attempt_rx_transfer_with_recovery(void)
 int main(void)
 {
     SYSCFG_DL_init();
-    printf("Master: auto-recover Hi->Hello123 loop starting\n");
+    printf("Master: request->read cell1 loop starting (slave addr=0x%02X)\n", (unsigned)I2C_TARGET_ADDRESS);
 
     /* Visual LED indicator */
     DL_GPIO_setPins(GPIO_LEDS_PORT, GPIO_LEDS_USER_LED_1_PIN);
@@ -202,23 +202,29 @@ int main(void)
             continue;
         }
 
-        /* Small pause between write and read */
-        delay_cycles(1000);
+        /* Small pause between write and read - allow slave to update */
+        delay_cycles(1000); /* adjust if needed */
 
         /* Attempt RX (internal retries + recovery) */
         if (attempt_rx_transfer_with_recovery() != 0) {
             continue;
         }
 
-        /* Print result safely (null terminate at expected length) */
-        if (I2C_RX_PACKET_SIZE < I2C_RX_MAX_PACKET_SIZE) {
-            gRxPacket[I2C_RX_PACKET_SIZE] = '\0';
+        /* On success: parse 2 bytes as little-endian uint16 (millivolts) */
+        /* On success: parse 4 bytes as two little-endian uint16 (millivolts) */
+        if (gRxCount >= 4) {
+            uint16_t mv1 = (uint16_t)gRxPacket[0] | ((uint16_t)gRxPacket[1] << 8);
+            uint16_t mv2 = (uint16_t)gRxPacket[2] | ((uint16_t)gRxPacket[3] << 8);
+            float v1 = ((float)mv1) / 1000.0f;
+            float v2 = ((float)mv2) / 1000.0f;
+            printf("Master received: Cell1 = %u mV (%.3f V), Cell2 = %u mV (%.3f V)\n",
+                (unsigned)mv1, v1, (unsigned)mv2, v2);
         } else {
-            gRxPacket[I2C_RX_MAX_PACKET_SIZE - 1] = '\0';
+            printf("Master: received %u bytes (expected 4)\n", (unsigned)gRxCount);
         }
-        printf("Master received (%u bytes): %s\n", (unsigned)gRxCount, (char*)gRxPacket);
 
-        /* Heartbeat */
+
+        /* Heartbeat toggle */
         DL_GPIO_togglePins(GPIO_LEDS_PORT, GPIO_LEDS_USER_LED_1_PIN | GPIO_LEDS_USER_TEST_PIN);
 
         /* Delay so console readable */
@@ -263,4 +269,3 @@ void I2C_INST_IRQHandler(void)
             break;
     }
 }
-
